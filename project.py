@@ -48,13 +48,15 @@ st.markdown("""
 st.sidebar.title("🛠️ Controllo")
 
 CSV_PATH = 'dati_project_statico.csv'
+# Set to True to show repaired/bad CSV line examples for debugging
+DEBUG_SHOW_REPAIRS = False
 
-# Proviamo a rilevare il separatore e a leggere in modo robusto, saltando righe malformate
+# Proviamo a rilevare il separatore e a leggere in modo robusto: tentiamo di riparare righe con numerici che contengono virgole
 try:
     with open(CSV_PATH, 'r', encoding='utf-8', errors='replace') as fh:
-        first_line = fh.readline()
+        header_line = fh.readline()
         try:
-            dialect = csv.Sniffer().sniff(first_line)
+            dialect = csv.Sniffer().sniff(header_line)
             sep = dialect.delimiter
         except Exception:
             sep = ','
@@ -62,59 +64,106 @@ except FileNotFoundError:
     st.error(f"File {CSV_PATH} non trovato. Carica il file nella cartella del progetto.")
     st.stop()
 
-# Leggiamo con engine='python' e saltiamo righe malformate; useremo dtype=str per tollerare formati sporchi
-df_all = None
-try:
-    df_all = pd.read_csv(CSV_PATH, sep=sep, engine='python', on_bad_lines='skip', dtype=str)
-except ParserError:
-    # Proviamo separatori alternativi
-    tried = False
-    for alt_sep in [';', ',']:
-        try:
-            df_all = pd.read_csv(CSV_PATH, sep=alt_sep, engine='python', on_bad_lines='skip', dtype=str)
-            sep = alt_sep
-            st.warning(f"Lettura CSV: usato separatore '{alt_sep}' come fallback e saltate righe malformate.")
-            tried = True
-            break
-        except Exception:
+# Leggiamo e ripariamo le righe malformate: ricostruiamo i campi numerici finali (PrezzoUnitario, Quantita, ImponibileRiga)
+from io import StringIO
+rows = []
+bad_lines = []
+repaired_examples = []
+with open(CSV_PATH, 'r', encoding='utf-8', errors='replace') as fh:
+    header = fh.readline().strip()
+    cols = [c.strip() for c in header.split(sep)]
+    expected = len(cols)
+
+    for i, raw in enumerate(fh, start=2):
+        line = raw.strip()
+        if not line:
             continue
-    if not tried:
-        st.error("Impossibile leggere il CSV: formato malformato. Controlla il file o carica un CSV valido.")
-        st.stop()
-except Exception as e:
-    st.error(f"Errore durante la lettura del CSV: {e}")
+        parts = line.split(sep)
+        if len(parts) == expected:
+            rows.append(parts)
+            continue
+        # Tentativo di riparazione: ricostruzione dei campi numerici finali
+        tail = parts[8:]
+        head = parts[:8]
+        repaired = None
+        try:
+            t = tail.copy()
+            # Ricostruisci Imponibile: spesso gli ultimi due frammenti rappresentano 'xxx,cc'
+            if len(t) >= 2 and t[-1].strip().isdigit() and len(t[-1].strip()) <= 2:
+                imponibile = t[-2].strip() + ',' + t[-1].strip()
+                t = t[:-2]
+            else:
+                imponibile = t[-1].strip()
+                t = t[:-1]
+            # Ricostruisci PrezzoUnitario
+            if len(t) >= 2 and t[1].strip().isdigit() and len(t[1].strip()) <= 2:
+                prezzo = t[0].strip() + ',' + t[1].strip()
+                quant_parts = t[2:]
+            else:
+                prezzo = t[0].strip() if t else ''
+                quant_parts = t[1:]
+            quantita = ''.join(p.strip() for p in quant_parts) if quant_parts else ''
+
+            candidate = head + [prezzo, quantita, imponibile]
+            if len(candidate) == expected:
+                repaired = candidate
+        except Exception:
+            repaired = None
+
+        if repaired:
+            rows.append(repaired)
+            if len(repaired_examples) < 5:
+                repaired_examples.append((i, line, sep.join(repaired)))
+        else:
+            bad_lines.append((i, line))
+
+# Costruiamo il DataFrame dalle righe valide
+if rows:
+    csv_buf = StringIO()
+    csv_buf.write(header + '\n')
+    # Normalizziamo i campi numerici finali per evitare virgole non quotate che rompono il CSV
+    def sanitize_num_field(s):
+        s = str(s).strip()
+        s = s.replace('.', '')  # rimuove separatori migliaia
+        s = s.replace(',', '.')  # usa punto come separatore decimale
+        return s
+
+    for r in rows:
+        r_copy = r.copy()
+        # Indici attesi: 8=PrezzoUnitario, 9=Quantita, 10=ImponibileRiga
+        for idx in [8, 9, 10]:
+            if idx < len(r_copy):
+                try:
+                    r_copy[idx] = sanitize_num_field(r_copy[idx])
+                except Exception:
+                    r_copy[idx] = r_copy[idx]
+        csv_buf.write(sep.join(r_copy) + '\n')
+    csv_buf.seek(0)
+    df_all = pd.read_csv(csv_buf, sep=sep, dtype=str)
+else:
+    st.error('Impossibile ricostruire righe valide dal CSV. Controlla il file sorgente.')
     st.stop()
 
-# Se è stato caricato, convertiamo le colonne utili a tipi corretti
-if df_all is None:
-    st.error("Nessun dato valido trovato nel CSV.")
-    st.stop()
+# Report su righe riparate e righe saltate (nascosto di default)
+if DEBUG_SHOW_REPAIRS:
+    if repaired_examples:
+        st.warning(f"Esempi di righe riparate (fino a 5):")
+        for ln, orig, new in repaired_examples:
+            st.write(f"Riga {ln} — orig: {orig} — riparata: {new}")
+    if bad_lines:
+        st.warning(f"Saltate {len(bad_lines)} righe troppo malformate per il recovery (mostro fino a 5):")
+        for ln, txt in bad_lines[:5]:
+            st.write(f"Riga {ln}: {txt}")
 
+# Convertiamo i tipi dove possibile: date e numerici (normalizziamo virgole -> punti e rimuoviamo migliaia)
 if 'DataFattura' in df_all.columns:
-    df_all['DataFattura'] = pd.to_datetime(df_all['DataFattura'], errors='coerce')
+    df_all['DataFattura'] = pd.to_datetime(df_all['DataFattura'].astype(str), errors='coerce')
 
 for col in ['ImponibileRiga', 'Quantita', 'PrezzoUnitario']:
     if col in df_all.columns:
-        df_all[col] = pd.to_numeric(df_all[col].astype(str).str.replace(r'[^0-9.\-]', '', regex=True), errors='coerce')
-
-# Se alcune righe sono state saltate, mostriamo un esempio delle righe malformate
-try:
-    with open(CSV_PATH, 'r', encoding='utf-8', errors='replace') as fh:
-        header = next(fh)
-        expected = len(header.strip().split(sep))
-        bad = []
-        for i, line in enumerate(fh, start=2):
-            if len(line.strip().split(sep)) != expected:
-                bad.append((i, line.strip()[:300]))
-                if len(bad) >= 5:
-                    break
-    if bad:
-        st.warning('Il CSV contiene righe con un numero di campi diverso dall\'header; ho caricato le righe valide (righe malformate saltate).')
-        for ln, txt in bad:
-            st.write(f"Riga {ln}: {txt}")
-except Exception:
-    # Non bloccante, ignoriamo eventuali problemi di apertura file per il report
-    pass
+        # Normalizziamo: sostituiamo virgola con punto (se presente) e rimuoviamo caratteri non numerici
+        df_all[col] = df_all[col].astype(str).str.replace(',', '.', regex=False)
+        df_all[col] = pd.to_numeric(df_all[col].str.replace(r'[^0-9.\-]', '', regex=True), errors='coerce')
 
 # Offriamo due 'tabella' semplificate: Fatture (righe) e Clienti (anagrafica)
 lista_tabelle = ['Fatture', 'Clienti']
