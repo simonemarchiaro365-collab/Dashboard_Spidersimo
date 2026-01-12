@@ -5,6 +5,8 @@ import numpy as np
 import plotly.express as px
 import folium
 from streamlit_folium import st_folium
+import csv
+from pandas.errors import ParserError
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
@@ -42,41 +44,94 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# 2. CONNESSIONE AL DATABASE
-conn = st.connection("sql")
-
-# 3. SIDEBAR (FILTRI E RICERCA)
+# 2. CARICAMENTO DATI DA FILE CSV
 st.sidebar.title("🛠️ Controllo")
-df_tabelle = conn.query("SELECT name FROM sys.tables")
-lista_tabelle = df_tabelle['name'].tolist()
 
-# --- MODIFICA: Rimuoviamo 'Fornitori' dalla lista ---
-if 'Fornitori' in lista_tabelle:
-    lista_tabelle.remove('Fornitori')
-if 'Corrieri' in lista_tabelle:
-    lista_tabelle.remove('Corrieri')
-if 'Prodotti' in lista_tabelle:
-    lista_tabelle.remove('Prodotti')
-# 2. Troviamo la posizione di 'Fatture' per impostarla come default
+CSV_PATH = 'dati_project_statico.csv'
+
+# Proviamo a rilevare il separatore e a leggere in modo robusto, saltando righe malformate
 try:
-    indice_fatture = lista_tabelle.index('Fatture')
-except ValueError:
-    indice_fatture = 0 # Fallback sulla prima se non esiste
+    with open(CSV_PATH, 'r', encoding='utf-8', errors='replace') as fh:
+        first_line = fh.readline()
+        try:
+            dialect = csv.Sniffer().sniff(first_line)
+            sep = dialect.delimiter
+        except Exception:
+            sep = ','
+except FileNotFoundError:
+    st.error(f"File {CSV_PATH} non trovato. Carica il file nella cartella del progetto.")
+    st.stop()
 
-# 3. Creiamo la selectbox usando l'indice trovato
-scelta_tabella = st.sidebar.selectbox(
-    "📂 Seleziona Tabella:", 
-    lista_tabelle, 
-    index=indice_fatture # Forza l'apertura su Fatture
-)
+# Leggiamo con engine='python' e saltiamo righe malformate; useremo dtype=str per tollerare formati sporchi
+df_all = None
+try:
+    df_all = pd.read_csv(CSV_PATH, sep=sep, engine='python', on_bad_lines='skip', dtype=str)
+except ParserError:
+    # Proviamo separatori alternativi
+    tried = False
+    for alt_sep in [';', ',']:
+        try:
+            df_all = pd.read_csv(CSV_PATH, sep=alt_sep, engine='python', on_bad_lines='skip', dtype=str)
+            sep = alt_sep
+            st.warning(f"Lettura CSV: usato separatore '{alt_sep}' come fallback e saltate righe malformate.")
+            tried = True
+            break
+        except Exception:
+            continue
+    if not tried:
+        st.error("Impossibile leggere il CSV: formato malformato. Controlla il file o carica un CSV valido.")
+        st.stop()
+except Exception as e:
+    st.error(f"Errore durante la lettura del CSV: {e}")
+    st.stop()
+
+# Se è stato caricato, convertiamo le colonne utili a tipi corretti
+if df_all is None:
+    st.error("Nessun dato valido trovato nel CSV.")
+    st.stop()
+
+if 'DataFattura' in df_all.columns:
+    df_all['DataFattura'] = pd.to_datetime(df_all['DataFattura'], errors='coerce')
+
+for col in ['ImponibileRiga', 'Quantita', 'PrezzoUnitario']:
+    if col in df_all.columns:
+        df_all[col] = pd.to_numeric(df_all[col].astype(str).str.replace(r'[^0-9.\-]', '', regex=True), errors='coerce')
+
+# Se alcune righe sono state saltate, mostriamo un esempio delle righe malformate
+try:
+    with open(CSV_PATH, 'r', encoding='utf-8', errors='replace') as fh:
+        header = next(fh)
+        expected = len(header.strip().split(sep))
+        bad = []
+        for i, line in enumerate(fh, start=2):
+            if len(line.strip().split(sep)) != expected:
+                bad.append((i, line.strip()[:300]))
+                if len(bad) >= 5:
+                    break
+    if bad:
+        st.warning('Il CSV contiene righe con un numero di campi diverso dall\'header; ho caricato le righe valide (righe malformate saltate).')
+        for ln, txt in bad:
+            st.write(f"Riga {ln}: {txt}")
+except Exception:
+    # Non bloccante, ignoriamo eventuali problemi di apertura file per il report
+    pass
+
+# Offriamo due 'tabella' semplificate: Fatture (righe) e Clienti (anagrafica)
+lista_tabelle = ['Fatture', 'Clienti']
+indice_fatture = 0
+scelta_tabella = st.sidebar.selectbox("📂 Seleziona Tabella:", lista_tabelle, index=indice_fatture)
 
 st.sidebar.divider()
 st.sidebar.subheader("🔍 Ricerca Rapida")
 filtro_testo = st.sidebar.text_input("Cerca valore nella tabella...")
 
 # 4. CARICAMENTO DATI
-query_completa = f"SELECT * FROM {scelta_tabella}"
-df_dati = conn.query(query_completa)
+if scelta_tabella == 'Fatture':
+    df_dati = df_all.copy()
+else:
+    # Costruiamo anagrafica clienti
+    cliente_cols = [c for c in ['IdCliente','Nome','Cognome','Nazione','Regione'] if c in df_all.columns]
+    df_dati = df_all[cliente_cols].drop_duplicates().reset_index(drop=True) 
 
 # Applica il filtro di ricerca se l'utente scrive qualcosa
 if filtro_testo:
@@ -98,7 +153,7 @@ with m3:
     valore = f" {df_dati['Spedizione'].sum():,.2f}" if 'Spedizione' in df_dati.columns else "N/A"
     st.metric("Volume Spedizioni", valore)
 with m4:
-    st.metric("Database", "SQL Server", delta="Online")
+    st.metric("Sorgente Dati", f"File: {CSV_PATH}", delta="Statico")
 
 st.divider()
 
@@ -121,15 +176,25 @@ with col_sx:
         ORDER BY Mese
         """
         
-        df_trend = conn.query(query_trend)
-        
-        
+        # Calcoliamo il trend mensile dal CSV
+        df_trend = df_all.copy()
+        if 'DataFattura' in df_trend.columns:
+            df_trend['Mese'] = df_trend['DataFattura'].dt.to_period('M').astype(str)
+        else:
+            df_trend['Mese'] = pd.to_datetime(df_trend.get('DataFattura', pd.Series([])), errors='coerce').dt.to_period('M').astype(str)
+        if 'ImponibileRiga' in df_trend.columns:
+            df_trend = df_trend.groupby('Mese')['ImponibileRiga'].sum().reset_index(name='TotaleFatturato').sort_values('Mese')
+        else:
+            df_trend = pd.DataFrame(columns=['Mese','TotaleFatturato'])
+
         # Creiamo il grafico ad area
-        st.area_chart(df_trend.set_index('Mese'), color="#1E3A8A", height=450)
-        
-        # Calcolo del totale per la didascalia
-        totale_periodo = df_trend['TotaleFatturato'].sum()
-        st.info(f"Valore totale imponibile nel periodo selezionato: **€ {totale_periodo:,.2f}**".replace(',', 'X').replace('.', ',').replace('X', '.'))
+        if not df_trend.empty:
+            st.area_chart(df_trend.set_index('Mese'), color="#1E3A8A", height=450)
+            # Calcolo del totale per la didascalia
+            totale_periodo = df_trend['TotaleFatturato'].sum()
+            st.info(f"Valore totale imponibile nel periodo selezionato: **€ {totale_periodo:,.2f}**".replace(',', 'X').replace('.', ',').replace('X', '.'))
+        else:
+            st.info("Nessun dato disponibile per il trend mensile.")
         st.divider()
 
     # CASO 2: Tabella Clienti (Grafico per Regione/Nazione)
@@ -169,21 +234,24 @@ with col_dx:
         GROUP BY C.Regione ORDER BY Fatturato DESC
         """
         try:
-            df_torta = conn.query(query_torta)
-            
-            # Creazione grafico a ciambella interattivo
-            fig = px.pie(df_torta, values='Fatturato', names='Regione', 
-                         color_discrete_sequence=px.colors.sequential.RdBu,
-                         hole=0.4)
-            
-            # Ottimizzazione spazio
-            fig.update_layout(margin=dict(t=0, b=0, l=0, r=0), showlegend=True, height=450)
-            st.plotly_chart(fig, use_container_width=True)
-            
-            # KPI Rapido: Regione Top
-            if not df_torta.empty:
-                top_reg = df_torta.iloc[0]['Regione']
-                st.info(f"📍 Regione dominante: **{top_reg}**")
+            # Raggruppamento per Regione dal CSV
+            if 'Regione' in df_all.columns and 'ImponibileRiga' in df_all.columns:
+                df_torta = df_all.groupby('Regione', dropna=False)['ImponibileRiga'].sum().reset_index(name='Fatturato').sort_values('Fatturato', ascending=False)
+                # Creazione grafico a ciambella interattivo
+                if not df_torta.empty:
+                    fig = px.pie(df_torta, values='Fatturato', names='Regione', 
+                                 color_discrete_sequence=px.colors.sequential.RdBu,
+                                 hole=0.4)
+                    # Ottimizzazione spazio
+                    fig.update_layout(margin=dict(t=0, b=0, l=0, r=0), showlegend=True, height=450)
+                    st.plotly_chart(fig, use_container_width=True)
+                    # KPI Rapido: Regione Top
+                    top_reg = df_torta.iloc[0]['Regione']
+                    st.info(f"📍 Regione dominante: **{top_reg}**")
+                else:
+                    st.info("Nessun dato per il grafico a torta.")
+            else:
+                st.info("Colonne 'Regione' o 'ImponibileRiga' mancanti nel file CSV.")
         except Exception as e:
             st.error(f"Errore grafico a torta: {e}")
 
@@ -195,13 +263,22 @@ st.divider()
 # --- SEZIONE: Grafico Temporale Fatture per Cliente ---
 if scelta_tabella == 'Fatture':
         # --- 1. RECUPERO TUTTI I MESI DISPONIBILI (PER ASSE FISSO) ---
-        query_tutti_mesi = "SELECT DISTINCT FORMAT(DataFattura, 'yyyy-MM') as Mese FROM Fatture ORDER BY Mese"
-        df_tutti_mesi = conn.query(query_tutti_mesi)
-        
+        # Lista mesi (uniquement dal CSV)
+        if 'DataFattura' in df_all.columns:
+            df_tutti_mesi = pd.DataFrame({'Mese': df_all['DataFattura'].dt.to_period('M').astype(str).unique()})
+            df_tutti_mesi = df_tutti_mesi.sort_values('Mese').reset_index(drop=True)
+        else:
+            df_tutti_mesi = pd.DataFrame({'Mese': []})
+
         # --- 2. FILTRO CLIENTE NELLA SIDEBAR ---
-        df_lista_clienti = conn.query("SELECT DISTINCT Nome + ' ' + Cognome as Cliente FROM Clienti")
-        lista_nomi = df_lista_clienti['Cliente'].tolist()
-        cliente_scelto = st.sidebar.selectbox("👤 Seleziona Cliente per andamento:", lista_nomi)
+        if {'Nome','Cognome'}.issubset(df_all.columns):
+            df_lista_clienti = df_all[['Nome','Cognome']].drop_duplicates()
+            df_lista_clienti['Cliente'] = df_lista_clienti['Nome'].astype(str) + ' ' + df_lista_clienti['Cognome'].astype(str)
+            lista_nomi = df_lista_clienti['Cliente'].tolist()
+            cliente_scelto = st.sidebar.selectbox("👤 Seleziona Cliente per andamento:", lista_nomi)
+        else:
+            lista_nomi = []
+            cliente_scelto = None
 
         st.subheader(f"📈 Andamento Fatturato: {cliente_scelto}")
         
@@ -218,27 +295,28 @@ if scelta_tabella == 'Fatture':
         """
         
         try:
-            df_singolo = conn.query(query_singolo)
+            # Filtra e aggrega per cliente selezionato
+            if cliente_scelto and 'Nome' in df_all.columns and 'Cognome' in df_all.columns and 'ImponibileRiga' in df_all.columns:
+                nome, cognome = cliente_scelto.split(' ', 1)
+                df_singolo = df_all[(df_all['Nome'] == nome) & (df_all['Cognome'] == cognome)].copy()
+                if 'DataFattura' in df_singolo.columns:
+                    df_singolo['Mese'] = df_singolo['DataFattura'].dt.to_period('M').astype(str)
+                else:
+                    df_singolo['Mese'] = pd.to_datetime(df_singolo.get('DataFattura', pd.Series([])), errors='coerce').dt.to_period('M').astype(str)
+                df_singolo = df_singolo.groupby('Mese')['ImponibileRiga'].sum().reset_index(name='TotaleImponibile')
+            else:
+                df_singolo = pd.DataFrame(columns=['Mese','TotaleImponibile'])
+
             df_completo = pd.merge(df_tutti_mesi, df_singolo, on='Mese', how='left').fillna(0)
-            
             # --- 3. CALCOLO LINEA DI TENDENZA ---
-            # Calcoliamo la media mobile a 3 mesi per ammorbidire la linea e vedere il trend
             df_completo['Tendenza'] = df_completo['TotaleImponibile'].rolling(window=3, min_periods=1).mean()
-            
             # Prepariamo il DataFrame per il grafico con due colonne
             df_plot = df_completo.set_index('Mese')[['TotaleImponibile', 'Tendenza']]
-            
             # --- 4. GRAFICO CON DUE COLORI ---
-            # Streamlit assegnerà colori diversi alle due colonne
             st.line_chart(df_plot, color=["#2563EB", "#FF4B4B"]) 
-            # Blu (#2563EB) per il reale, Rosso (#FF4B4B) per la tendenza
-            
             st.caption("🔵 Fatturato Reale | 🔴 Linea di Tendenza (Media Mobile 3 mesi)")
-            
-            # KPI
             tot_storico = df_singolo['TotaleImponibile'].sum() if not df_singolo.empty else 0
             st.metric("Fatturato Totale (Imponibile)", f"€ {tot_storico:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.'))
-            
             st.divider()
             
         except Exception as e:
@@ -305,25 +383,31 @@ if scelta_tabella == 'Fatture':
     """
     
     try:
-        df_mappa = conn.query(query_mappa)
-        
+        # Costruiamo df_mappa aggregando per regione dal CSV
+        if 'Regione' in df_all.columns and 'ImponibileRiga' in df_all.columns:
+            df_mappa = df_all.copy()
+            # Mappiamo regioni mancanti per Francia
+            if 'Regione' in df_mappa.columns and 'Nazione' in df_mappa.columns:
+                df_mappa['Regione'] = df_mappa['Regione'].fillna('').astype(str)
+                df_mappa.loc[(df_mappa['Nazione']=='Francia') & (df_mappa['Regione']==''), 'Regione'] = 'Île-de-France'
+            else:
+                df_mappa['Regione'] = df_mappa.get('Regione', pd.Series([''] * len(df_mappa)))
+            df_mappa = df_mappa.groupby('Regione', dropna=False).agg(NumClienti=('IdCliente','nunique'), FatturatoTotale=('ImponibileRiga','sum')).reset_index()
+        else:
+            df_mappa = pd.DataFrame(columns=['Regione','NumClienti','FatturatoTotale'])
+
         if not df_mappa.empty:
             # Aggiungi le coordinate alle regioni
             df_mappa['Lat'] = df_mappa['Regione'].apply(lambda x: coordinate_regioni.get(x, {}).get('lat', 42.0))
             df_mappa['Lon'] = df_mappa['Regione'].apply(lambda x: coordinate_regioni.get(x, {}).get('lon', 12.0))
-            
             # Normalizza il fatturato per il colore e size
             max_fatturato = df_mappa['FatturatoTotale'].max()
             min_fatturato = df_mappa['FatturatoTotale'].min()
-            
-            # Crea colonne RGB basate sul fatturato (dal blu al rosso)
             df_mappa['color_intensity'] = (df_mappa['FatturatoTotale'] - min_fatturato) / (max_fatturato - min_fatturato) if max_fatturato > min_fatturato else 0.5
-            
             # Gradient: Blu (basso) -> Giallo -> Rosso (alto)
             df_mappa['r'] = (df_mappa['color_intensity'] * 255).astype(int)
             df_mappa['g'] = ((1 - abs(df_mappa['color_intensity'] - 0.5) * 2) * 255).astype(int)
             df_mappa['b'] = ((1 - df_mappa['color_intensity']) * 255).astype(int)
-            
             # Crea lista di punti per la heatmap
             points = []
             for idx, row in df_mappa.iterrows():
@@ -408,94 +492,52 @@ if scelta_tabella == 'Fatture':
     """
     
     try:
-        df_cluster_data = conn.query(query_cluster)
-        
+        # Per il clustering usiamo il df_mappa costruito sopra
+        df_cluster_data = df_mappa.copy()
         if not df_cluster_data.empty:
-            # Prepara i dati per il clustering
+            # Assicuriamoci di avere QuantitaTotale (se manca, usiamo 0)
+            if 'QuantitaTotale' not in df_cluster_data.columns and 'Quantita' in df_all.columns:
+                q = df_all.copy()
+                if 'Regione' in q.columns and 'Nazione' in q.columns:
+                    q['Regione'] = q['Regione'].fillna('').astype(str)
+                    q.loc[(q['Nazione']=='Francia') & (q['Regione']=='') , 'Regione'] = 'Île-de-France'
+                quant = q.groupby('Regione')['Quantita'].sum().reset_index(name='QuantitaTotale')
+                df_cluster_data = df_cluster_data.merge(quant, on='Regione', how='left')
+                df_cluster_data['QuantitaTotale'] = df_cluster_data['QuantitaTotale'].fillna(0)
+
             X = df_cluster_data[['NumClienti', 'FatturatoTotale']].values
-            
-            # Normalizza i dati
             scaler = StandardScaler()
             X_scaled = scaler.fit_transform(X)
-            
-            # Applica K-means (3 cluster)
             kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
             df_cluster_data['Cluster'] = kmeans.fit_predict(X_scaled)
-            
-            # Aggiungi etichette descrittive ai cluster
-            cluster_labels = {
-                0: 'Cluster A',
-                1: 'Cluster B',
-                2: 'Cluster C'
-            }
+            cluster_labels = {0: 'Cluster A', 1: 'Cluster B', 2: 'Cluster C'}
             df_cluster_data['Cluster_Label'] = df_cluster_data['Cluster'].map(cluster_labels)
-            
-            # Crea scatter plot interattivo con Plotly
+
             fig_cluster = px.scatter(
                 df_cluster_data,
                 x='NumClienti',
                 y='FatturatoTotale',
                 color='Cluster_Label',
-                size='QuantitaTotale',
+                size='QuantitaTotale' if 'QuantitaTotale' in df_cluster_data.columns else None,
                 hover_name='Regione',
-                hover_data={
-                    'NumClienti': True,
-                    'FatturatoTotale': ':.0f',
-                    'QuantitaTotale': True,
-                    'Cluster_Label': True
-                },
                 title='Clustering Regioni: Clienti vs Fatturato',
-                labels={
-                    'NumClienti': 'Numero Clienti',
-                    'FatturatoTotale': 'Fatturato Totale (€)',
-                    'Cluster_Label': 'Cluster'
-                },
-                color_discrete_map={
-                    'Cluster A': '#3B82F6',  # Blu
-                    'Cluster B': '#10B981',  # Verde
-                    'Cluster C': '#F59E0B'   # Arancione
-                }
+                labels={'NumClienti': 'Numero Clienti', 'FatturatoTotale': 'Fatturato Totale (€)', 'Cluster_Label': 'Cluster'},
+                color_discrete_map={'Cluster A': '#3B82F6', 'Cluster B': '#10B981', 'Cluster C': '#F59E0B'}
             )
-            
-            # Aggiungi testo per le regioni
-            fig_cluster.update_traces(
-                textposition='top center',
-                textfont=dict(size=10),
-                mode='markers+text'
-            )
-            
-            # Personalizza il layout
-            fig_cluster.update_layout(
-                height=500,
-                hovermode='closest',
-                template='plotly_dark',
-                font=dict(size=12),
-                xaxis=dict(showgrid=True, gridwidth=1, gridcolor='#444'),
-                yaxis=dict(showgrid=True, gridwidth=1, gridcolor='#444'),
-                plot_bgcolor='#1a1a1a'
-            )
-            
+            fig_cluster.update_traces(textposition='top center', textfont=dict(size=10), mode='markers+text')
+            fig_cluster.update_layout(height=500, hovermode='closest', template='plotly_dark', font=dict(size=12), plot_bgcolor='#1a1a1a')
             st.plotly_chart(fig_cluster, use_container_width=True)
-            
-            # Analisi dettagliata per cluster
+
             st.write("### 📊 Analisi per Cluster:")
-            
             col1, col2, col3 = st.columns(3)
-            
             for cluster_id in range(3):
                 cluster_name = cluster_labels[cluster_id]
                 df_cluster_subset = df_cluster_data[df_cluster_data['Cluster'] == cluster_id]
-                
                 with [col1, col2, col3][cluster_id]:
-                    st.metric(
-                        label=f"**{cluster_name}**",
-                        value=len(df_cluster_subset),
-                        delta="regioni"
-                    )
-                    st.write(f"**Regioni:** {', '.join(df_cluster_subset['Regione'].tolist())}")
+                    st.metric(label=f"**{cluster_name}**", value=len(df_cluster_subset), delta="regioni")
+                    st.write(f"**Regioni:** {', '.join(df_cluster_subset['Regione'].dropna().astype(str).tolist())}")
                     st.write(f"**Fatturato Medio:** €{df_cluster_subset['FatturatoTotale'].mean():,.0f}")
                     st.write(f"**Clienti Medi:** {df_cluster_subset['NumClienti'].mean():.0f}")
-            
         else:
             st.warning("⚠️ Nessun dato disponibile per il clustering.")
             
@@ -528,34 +570,43 @@ if scelta_tabella == 'Fatture':
     """
     
     try:
-        df_health = conn.query(query_health)
-        
+        # Creiamo il dataframe health partendo dal CSV
+        if {'IdCliente','DataFattura','ImponibileRiga'}.issubset(df_all.columns):
+            gp = df_all.groupby('IdCliente')
+            df_health = gp.agg(
+                Cliente=('IdCliente', lambda x: (df_all.loc[x.index[0],'Nome'] + ' ' + df_all.loc[x.index[0],'Cognome']) if 'Nome' in df_all.columns and 'Cognome' in df_all.columns else x.name),
+                NumFatture=('IdFattura', 'nunique'),
+                UltimaFattura=('DataFattura', 'max'),
+                PrimaFattura=('DataFattura', 'min'),
+                FatturatoTotale=('ImponibileRiga','sum')
+            ).reset_index()
+            # Calcoli aggiuntivi
+            df_health['GiorniAttivi'] = (df_health['UltimaFattura'] - df_health['PrimaFattura']).dt.days
+            max_date = df_all['DataFattura'].max()
+            df_health['GiorniInattivo'] = (max_date - df_health['UltimaFattura']).dt.days
+            # Giorni tra fatture (media)
+            def avg_days_between(idc):
+                dats = sorted(df_all[df_all['IdCliente']==idc]['DataFattura'].dropna().unique())
+                if len(dats) <= 1:
+                    return float('nan')
+                diffs = [(dats[i+1]-dats[i]).days for i in range(len(dats)-1)]
+                return sum(diffs)/len(diffs)
+            df_health['GiorniTraFatture'] = df_health['IdCliente'].apply(lambda x: avg_days_between(x))
+            # Fatturato medio
+            df_health['FatturatoMedio'] = df_health['FatturatoTotale'] / df_health['NumFatture']
+            df_health = df_health[df_health['NumFatture']>0]
+        else:
+            df_health = pd.DataFrame()
+
         if not df_health.empty:
-            # Calcola Health Score intelligente basato su frequenza attesa
-            # Ritardo = GiorniInattivo vs GiorniTraFatture (frequenza media)
-            
             df_health['RitardoRispettoFrequenza'] = df_health['GiorniInattivo'] / df_health['GiorniTraFatture'].replace(0, 1)
-            
-            # Normalizza i metriche per lo score
             max_fatture = df_health['NumFatture'].max()
             max_fatturato = df_health['FatturatoMedio'].max()
-            
-            # Health Score intelligente (0-100)
-            df_health['Score_Frequenza'] = (df_health['NumFatture'] / max_fatture) * 35  # 35 punti
-            df_health['Score_Valore'] = (df_health['FatturatoMedio'] / max_fatturato) * 35  # 35 punti
-            
-            # Rischio basato sul ritardo rispetto alla frequenza attesa
-            # Se RitardoRispettoFrequenza < 1: è in anticipo (buono)
-            # Se RitardoRispettoFrequenza = 1: è on-time
-            # Se RitardoRispettoFrequenza > 1.5: è in ritardo (male)
-            df_health['Score_Ritardo'] = (1 / (df_health['RitardoRispettoFrequenza'].clip(lower=0.1) + 0.5)) * 30  # 30 punti
+            df_health['Score_Frequenza'] = (df_health['NumFatture'] / max_fatture) * 35 if max_fatture>0 else 0
+            df_health['Score_Valore'] = (df_health['FatturatoMedio'] / max_fatturato) * 35 if max_fatturato>0 else 0
+            df_health['Score_Ritardo'] = (1 / (df_health['RitardoRispettoFrequenza'].clip(lower=0.1) + 0.5)) * 30
             df_health['Score_Ritardo'] = df_health['Score_Ritardo'].clip(upper=30)
-            
-            df_health['HealthScore'] = (df_health['Score_Frequenza'] + 
-                                       df_health['Score_Valore'] + 
-                                       df_health['Score_Ritardo']).round(1)
-            
-            # Classifica i clienti
+            df_health['HealthScore'] = (df_health['Score_Frequenza'] + df_health['Score_Valore'] + df_health['Score_Ritardo']).round(1)
             def classify_health(score):
                 if score >= 70:
                     return '🟢 Healthy'
@@ -563,88 +614,32 @@ if scelta_tabella == 'Fatture':
                     return '🟡 At Risk'
                 else:
                     return '🔴 Critical'
-            
             df_health['Categoria'] = df_health['HealthScore'].apply(classify_health)
-            
+
             # KPI per categoria
             st.write("### 📊 Distribuzione Salute Clienti:")
-            
             col_h1, col_h2, col_h3 = st.columns(3)
-            
             healthy = len(df_health[df_health['HealthScore'] >= 70])
             at_risk = len(df_health[(df_health['HealthScore'] >= 45) & (df_health['HealthScore'] < 70)])
             critical = len(df_health[df_health['HealthScore'] < 45])
-            
             with col_h1:
-                st.metric(
-                    label="🟢 Healthy",
-                    value=healthy,
-                    delta=f"{(healthy/len(df_health)*100):.0f}%"
-                )
+                st.metric(label="🟢 Healthy", value=healthy, delta=f"{(healthy/len(df_health)*100):.0f}%")
             with col_h2:
-                st.metric(
-                    label="🟡 At Risk",
-                    value=at_risk,
-                    delta=f"{(at_risk/len(df_health)*100):.0f}%"
-                )
+                st.metric(label="🟡 At Risk", value=at_risk, delta=f"{(at_risk/len(df_health)*100):.0f}%")
             with col_h3:
-                st.metric(
-                    label="🔴 Critical",
-                    value=critical,
-                    delta=f"{(critical/len(df_health)*100):.0f}%"
-                )
-            
-            # Grafico a bolle: Frequenza vs Fatturato vs HealthScore
-            fig_health = px.scatter(
-                df_health,
-                x='GiorniTraFatture',
-                y='FatturatoMedio',
-                size='HealthScore',
-                color='Categoria',
-                hover_name='Cliente',
-                hover_data={
-                    'NumFatture': True,
-                    'GiorniTraFatture': ':.0f',
-                    'GiorniInattivo': True,
-                    'FatturatoMedio': ':.0f',
-                    'HealthScore': ':.1f',
-                    'RitardoRispettoFrequenza': ':.2f',
-                    'Categoria': False
-                },
-                title='Client Health Score: Frequenza Attesa vs Valore Medio',
-                labels={
-                    'GiorniTraFatture': 'Giorni Tra Fatture (Media)',
-                    'FatturatoMedio': 'Fatturato Medio (€)',
-                    'Categoria': 'Salute'
-                },
-                color_discrete_map={
-                    '🟢 Healthy': '#10B981',
-                    '🟡 At Risk': '#F59E0B',
-                    '🔴 Critical': '#EF4444'
-                }
-            )
-            
-            fig_health.update_layout(
-                height=500,
-                template='plotly_dark',
-                hovermode='closest'
-            )
-            
+                st.metric(label="🔴 Critical", value=critical, delta=f"{(critical/len(df_health)*100):.0f}%")
+
+            # Grafico e tabella come prima (riutilizza codice sottostante)
+            fig_health = px.scatter(df_health, x='GiorniTraFatture', y='FatturatoMedio', size='HealthScore', color='Categoria', hover_name='Cliente', title='Client Health Score: Frequenza Attesa vs Valore Medio', color_discrete_map={'🟢 Healthy': '#10B981','🟡 At Risk': '#F59E0B','🔴 Critical': '#EF4444'})
+            fig_health.update_layout(height=500, template='plotly_dark', hovermode='closest')
             st.plotly_chart(fig_health, use_container_width=True)
-            
+
             st.caption("💡 Asse X = Giorni medi tra fatture | Bolle grandi = Health Score alto | Colore = Rischio churn")
-            
-            # Tabella clienti critici
+
             st.write("### ⚠️ Clienti Critici - Rischio Churn Elevato:")
-            
             df_critical = df_health[df_health['HealthScore'] < 45].sort_values('HealthScore').head(10)
-            
             if not df_critical.empty:
-                df_critical_display = df_critical[[
-                    'Cliente', 'HealthScore', 'Score_Frequenza', 'Score_Valore', 'Score_Ritardo',
-                    'RitardoRispettoFrequenza', 'GiorniInattivo', 'GiorniTraFatture', 'NumFatture', 'FatturatoMedio'
-                ]].copy()
-                
+                df_critical_display = df_critical[[ 'Cliente', 'HealthScore', 'Score_Frequenza', 'Score_Valore', 'Score_Ritardo', 'RitardoRispettoFrequenza', 'GiorniInattivo', 'GiorniTraFatture', 'NumFatture', 'FatturatoMedio' ]].copy()
                 df_critical_display['HealthScore'] = df_critical_display['HealthScore'].apply(lambda x: f"{x:.1f}/100")
                 df_critical_display['Score_Frequenza'] = df_critical_display['Score_Frequenza'].apply(lambda x: f"{x:.1f}/35")
                 df_critical_display['Score_Valore'] = df_critical_display['Score_Valore'].apply(lambda x: f"{x:.1f}/35")
@@ -652,21 +647,14 @@ if scelta_tabella == 'Fatture':
                 df_critical_display['RitardoRispettoFrequenza'] = df_critical_display['RitardoRispettoFrequenza'].apply(lambda x: f"{x:.1f}x")
                 df_critical_display['GiorniTraFatture'] = df_critical_display['GiorniTraFatture'].apply(lambda x: f"{x:.0f} gg")
                 df_critical_display['FatturatoMedio'] = df_critical_display['FatturatoMedio'].apply(lambda x: f"€{x:,.0f}")
-                df_critical_display.columns = [
-                    'Cliente', 'Total Score', 'Freq↓', 'Valore↓', 'Ritardo↓',
-                    'Ritardo vs Abitudini', 'Giorni Inattivo', 'Freq Media', 'Fatture', 'Fatturato Med'
-                ]
-                
-                # Evidenzia il valore minimo tra i 3 score per ogni riga
+                df_critical_display.columns = [ 'Cliente', 'Total Score', 'Freq↓', 'Valore↓', 'Ritardo↓', 'Ritardo vs Abitudini', 'Giorni Inattivo', 'Freq Media', 'Fatture', 'Fatturato Med' ]
                 def highlight_min_score(row):
                     colors = [''] * len(row)
                     try:
                         freq_val = float(row['Freq↓'].split('/')[0])
                         valore_val = float(row['Valore↓'].split('/')[0])
                         ritardo_val = float(row['Ritardo↓'].split('/')[0])
-                        
                         min_val = min(freq_val, valore_val, ritardo_val)
-                        
                         if freq_val == min_val:
                             colors[2] = 'background-color: yellow; font-weight: bold'
                         elif valore_val == min_val:
@@ -676,16 +664,8 @@ if scelta_tabella == 'Fatture':
                     except:
                         pass
                     return colors
-                
                 styled_df = df_critical_display.style.apply(highlight_min_score, axis=1)
-                
-                st.dataframe(
-                    styled_df,
-                    use_container_width=True,
-                    hide_index=True,
-                    height=350
-                )
-                
+                st.dataframe(styled_df, use_container_width=True, hide_index=True, height=350)
                 st.write("**📌 Come leggere la tabella:**")
                 st.write("""
                 - **Total Score**: Somma dei 3 fattori (0-100)
@@ -693,15 +673,12 @@ if scelta_tabella == 'Fatture':
                 - **Valore↓**: Score valore medio (basso = spende poco per fattura)
                 - **Ritardo↓**: Score puntualità (basso = MOLTO ritardato rispetto al suo solito)
                 - **Ritardo vs Abitudini**: Es. 1.5x = compra con 50% più ritardo del solito
-                
                 **La cella più scura = il punto debole principale del cliente**
                 """)
             else:
                 st.success("✅ Nessun cliente critico! Tutti i clienti sono in buona salute.")
-                
         else:
             st.warning("⚠️ Nessun dato disponibile per il health score.")
-            
     except Exception as e:
         st.error(f"Errore nel calcolo del health score: {e}")
 
@@ -717,20 +694,18 @@ if scelta_tabella == 'Fatture':
     JOIN Prodotti P ON FP.IdProdotto = P.IdProdotto
     GROUP BY P.DescrizioneProdotto ORDER BY Totale DESC
     """
-    df_p = conn.query(query_p)
+    # Calcolo top prodotti dal CSV (usiamo IdProdotto o Descrizione se presente)
+    if 'IdProdotto' in df_all.columns:
+        df_p = df_all.groupby(df_all['IdProdotto'].astype(str).rename('Prodotto')).agg(Quantita=('Quantita','sum'), Totale=('ImponibileRiga','sum')).reset_index().sort_values('Totale', ascending=False).head(5)
+    else:
+        df_p = pd.DataFrame(columns=['Prodotto','Quantita','Totale'])
 
-    # Creazione dei 5 riquadri in orizzontale
     col1, col2, col3, col4, col5 = st.columns(5)
     cols = [col1, col2, col3, col4, col5]
-    
     for i, (idx, row) in enumerate(df_p.iterrows()):
         valore_f = f"{row['Totale']:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.')
         with cols[i]:
-            st.metric(
-                label=row['DescrizioneProdotto'][:20],  # Limita il testo a 20 caratteri
-                value=f"{valore_f} €",
-                delta=f"{int(row['Quantita'])} unità"
-            )
+            st.metric(label=str(row['Prodotto'])[:20], value=f"{valore_f} €", delta=f"{int(row['Quantita'])} unità")
 
     # --- AGGIUNTA 2: Top 10 Prodotti a LARGHEZZA PIENA (SOTTO) ---
     st.divider()
@@ -745,13 +720,13 @@ if scelta_tabella == 'Fatture':
     """
     
     try:
-        df_prodotti = conn.query(query_top_prodotti)
-        
-        # Grafico a barre con i nomi dei prodotti - LARGHEZZA PIENA
-        st.bar_chart(df_prodotti.set_index('DescrizioneProdotto'), color="#60A5FA", height=400)
-        
+        if 'IdProdotto' in df_all.columns:
+            df_prodotti = df_all.groupby(df_all['IdProdotto'].astype(str).rename('Prodotto'))['ImponibileRiga'].sum().reset_index().sort_values('ImponibileRiga', ascending=False).head(10).set_index('Prodotto')
+            st.bar_chart(df_prodotti, color="#60A5FA", height=400)
+        else:
+            st.info('Nessun dato prodotti nel CSV.')
     except Exception as e:
-        st.error("⚠️ Verifica che esistano le tabelle 'FattureProdotti' e 'Prodotti' e che le colonne siano corrette!")
+        st.error("⚠️ Errore durante il calcolo dei prodotti: {0}".format(e))
 
 # --- SEZIONE PRODOTTI STAGNANTI ---
 st.divider()
@@ -773,49 +748,48 @@ HAVING DATEDIFF(DAY, MAX(F.DataFattura), CAST('2020-12-31' AS DATE)) >= 90
 ORDER BY GiorniInattivo DESC
 """
 
-try:
-    df_stagnanti = conn.query(query_stagnanti)
+# Analisi prodotti stagnanti: ultimi 90 giorni rispetto alla massima data disponibile
+max_date = df_all['DataFattura'].max() if 'DataFattura' in df_all.columns else pd.Timestamp.today()
+if 'IdProdotto' in df_all.columns:
+    last_sale = df_all.groupby('IdProdotto').agg(UltimaVendita=('DataFattura','max'), FatturatoTotale=('ImponibileRiga','sum'), QuantitaTotale=('Quantita','sum'), NumeroOrdini=('IdFattura','nunique')).reset_index()
+    last_sale['GiorniInattivo'] = (max_date - last_sale['UltimaVendita']).dt.days
+    df_stagnanti = last_sale[last_sale['GiorniInattivo'] >= 90].sort_values('GiorniInattivo', ascending=False)
+else:
+    df_stagnanti = pd.DataFrame()
+
+if not df_stagnanti.empty:
+    df_stagnanti_display = df_stagnanti.copy()
+    df_stagnanti_display['UltimaVendita'] = pd.to_datetime(df_stagnanti_display['UltimaVendita']).dt.strftime('%d/%m/%Y')
+    df_stagnanti_display['FatturatoTotale'] = df_stagnanti_display['FatturatoTotale'].apply(lambda x: f"€{x:,.2f}")
+    df_stagnanti_display.columns = [ 'Prodotto', 'Ultimo Acquisto', 'Giorni Fermi', 'Fatturato Tot.', 'Unità', 'Ordini' ]
     
-    if not df_stagnanti.empty:
-        # Prepara i dati per visualizzazione
-        df_stagnanti_display = df_stagnanti.copy()
-        df_stagnanti_display['UltimaVendita'] = pd.to_datetime(df_stagnanti_display['UltimaVendita']).dt.strftime('%d/%m/%Y')
-        df_stagnanti_display['FatturatoTotale'] = df_stagnanti_display['FatturatoTotale'].apply(lambda x: f"€{x:,.2f}")
-        df_stagnanti_display.columns = [
-            'Prodotto', 'Ultimo Acquisto', 'Giorni Fermi', 'Fatturato Tot.', 'Unità', 'Ordini'
-        ]
-        
-        # Grafico: Prodotti per giorni di inattività
-        st.subheader("📉 Timeline Inattività Prodotti")
-        fig = px.bar(
-            df_stagnanti,
-            y='DescrizioneProdotto',
-            x='GiorniInattivo',
-            orientation='h',
-            color='GiorniInattivo',
-            color_continuous_scale='Reds',
-            labels={'GiorniInattivo': 'Giorni Senza Vendite', 'DescrizioneProdotto': 'Prodotto'},
-            height=400
-        )
-        fig.update_layout(showlegend=False, xaxis_title='Giorni Senza Vendite')
-        st.plotly_chart(fig, use_container_width=True)
-        
-        # Tabella dettagli
-        st.subheader("📋 Dettagli Prodotti Stagnanti")
-        st.dataframe(
-            df_stagnanti_display,
-            use_container_width=True,
-            hide_index=True,
-            height=350
-        )
-        
-        st.info(f"⚠️ **{len(df_stagnanti)} prodotti non venduti da almeno 90 giorni**. Considera di: rimuoverli dal catalogo, fare promozioni, o bundle con best-seller.")
-        
-    else:
-        st.success("✅ Nessun prodotto stagnante! Tutti i prodotti sono stati venduti negli ultimi 3 mesi.")
-        
-except Exception as e:
-    st.error(f"❌ Errore nel caricamento prodotti stagnanti: {e}")
+    # Grafico: Prodotti per giorni di inattività
+    st.subheader("📉 Timeline Inattività Prodotti")
+    fig = px.bar(
+        df_stagnanti,
+        y='IdProdotto',
+        x='GiorniInattivo',
+        orientation='h',
+        color='GiorniInattivo',
+        color_continuous_scale='Reds',
+        labels={'GiorniInattivo': 'Giorni Senza Vendite', 'IdProdotto': 'Prodotto'},
+        height=400
+    )
+    fig.update_layout(showlegend=False, xaxis_title='Giorni Senza Vendite')
+    st.plotly_chart(fig, use_container_width=True)
+    
+    # Tabella dettagli
+    st.subheader("📋 Dettagli Prodotti Stagnanti")
+    st.dataframe(
+        df_stagnanti_display,
+        use_container_width=True,
+        hide_index=True,
+        height=350
+    )
+    
+    st.info(f"⚠️ **{len(df_stagnanti)} prodotti non venduti da almeno 90 giorni**. Considera di: rimuoverli dal catalogo, fare promozioni, o bundle con best-seller.")
+else:
+    st.success("✅ Nessun prodotto stagnante! Tutti i prodotti sono stati venduti negli ultimi 3 mesi.")
 
 # 7. VISUALIZZAZIONE DATI INTEGRALE
 st.divider()
