@@ -11,3 +11,6 @@ pyodbc==5.3.0
 # Optional/dev:
 # scipy==1.16.3
 # pyarrow==22.0.0
+streamlit
+sqlalchemy
+pyodbc
